@@ -1,71 +1,79 @@
 [package]
 name = "kafka-delta-ingest"
-version = "0.2.0"
+version = "1.8.6"
 authors = ["R. Tyler Croy <rtyler@brokenco.de>", "Christian Williams <christianw@scribd.com>"]
 edition = "2018"
 
 [dependencies]
-flate2 = "1.0"
 anyhow = "1"
 async-trait = "0.1"
+async-channel = "2.3.1"
 apache-avro = "^0.14"
 base64 = "0.13"
 bytes = "1"
 chrono = "0.4.31"
 clap = { version = "4", features = ["color", "env"] }
 dipstick = "0.9"
+metrics-exporter-prometheus = "0.14"
+metrics = "0.22"
+metrics-util = "0.16"
 env_logger = "0"
 futures = "0.3"
 jmespatch = { version = "0.3", features = ["sync"] }
 lazy_static = "1"
 log = "0"
 maplit = "1"
-rdkafka = { version = "0.28", features = ["ssl"] }
-schema_registry_converter = { version = "3.1.0", features = ["easy", "json", "avro"] }
+rdkafka = { version = "0.36.2", features = ["ssl-vendored"] }
+schema_registry_converter = { version = "4.1.0", features = ["easy", "json", "avro", "proto_decoder"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 strum = "0.20"
 strum_macros = "0.20"
 thiserror = "1"
 tokio = { version = "1", features = ["full"] }
+
 tokio-stream = { version = "0", features = ["fs"] }
 tokio-util = "0.6.3"
 uuid = { version = "0.8", features = ["serde", "v4"] }
 url = "2.3"
+statsd-mock = "0.1.0"
+indexmap = "1.6.0"
+regex = "1.10.2"
+rand = "0.8.5"
 
-# datafusion feature is required for writer version 2
-deltalake-core = { version = "~0.18.1", features = ["json", "datafusion"]}
-deltalake-aws = { version = "~0.1.2", optional = true }
-deltalake-azure = { version = "~0.1.3", optional = true }
+deltalake-core = { version = "0.21.0", features = ["json", "datafusion"]}
+deltalake-aws = { version = "0.4.1"}
 
-# s3 feature enabled, helps for locking interactions with DLQ
-dynamodb_lock = { version = "0.6.0", optional = true }
-# sentry
-sentry = { version = "0.23.0", optional = true }
-
-[features]
-default = []
-sentry-ext = ["sentry"]
-dynamic-linking = [ "rdkafka/dynamic-linking" ]
-azure = [
-    "deltalake-azure",
-]
-s3 = [
-    "deltalake-aws",
-    "dynamodb_lock",
-]
-
-[dev-dependencies]
-azure_core = { version = "0.18.0" }
-azure_storage = { version = "0.18.0" }
-azure_storage_blobs = { version = "0.18.0" }
+dynamodb_lock = { version = "0.6.0"}
 rusoto_core = { version = "0.47", default-features = false, features = ["rustls"]}
 rusoto_credential = { version = "0.47"}
 rusoto_s3 = { version = "0.47", default-features = false, features = ["rustls"]}
+
+sentry = { version = "0.23.0", optional = true }
+
+akuna-deserializer = {version = "0.1.0", git = "ssh://git@bitbucket:7999/hbl/akuna-deserializer.git", optional = true}
+protobuf = { version = "3", optional = true }
+protofish = { version = "0", optional = true }
+
+
+[features]
+default = ["sentry-ext", "akunaformats"]
+sentry-ext = ["sentry"]
+dynamic-linking = [ "rdkafka/dynamic-linking" ]
+akunaformats = ["akuna-deserializer", "protofish", "protobuf"]
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.5"
+
+[dev-dependencies]
+utime = "0.3"
 serial_test = "*"
 tempfile = "3"
 time = "0.3.20"
-utime = "0.3"
 
 [profile.release]
 lto = true
+
+[patch.crates-io]
+protofish = { git = 'https://github.com/leonoosterwijk/protofish.git', branch = 'bugfix/ident_can_start_with_underscore' }
+schema_registry_converter = { git = 'https://github.com/leonoosterwijk/schema_registry_converter.git', branch = 'bugfix/caching' }

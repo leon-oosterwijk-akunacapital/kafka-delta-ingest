@@ -1,22 +1,20 @@
 use crate::transforms::Transformer;
+use crate::{transforms::TransformError, writer::*, IngestError};
 use async_trait::async_trait;
 use chrono::prelude::*;
 use core::fmt::Debug;
+use deltalake_core::kernel::{DataType, PrimitiveType, StructField};
 use deltalake_core::parquet::errors::ParquetError;
 use deltalake_core::{DeltaTable, DeltaTableError};
-#[cfg(feature = "s3")]
 use dynamodb_lock::dynamo_lock_options;
-use log::{error, info, warn};
-#[cfg(feature = "s3")]
+use indexmap::IndexMap;
+use log::{debug, error, info, warn};
 use maplit::hashmap;
 use rdkafka::message::BorrowedMessage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
-use crate::{transforms::TransformError, writer::*};
-
-#[cfg(feature = "s3")]
 mod env_vars {
     pub(crate) const DEAD_LETTER_DYNAMO_LOCK_PARTITION_KEY_VALUE: &str =
         "DEAD_LETTER_DYNAMO_LOCK_PARTITION_KEY_VALUE";
@@ -38,6 +36,20 @@ pub struct DeadLetter {
 }
 
 impl DeadLetter {
+    /// Creates a dead letter from bytes that failed ingest.
+    pub(crate) fn from_failed_ingest(err: IngestError) -> Self {
+        let timestamp = Utc::now();
+        Self {
+            base64_bytes: None,
+            json_string: None,
+            error: Some(err.to_string()),
+            timestamp: timestamp
+                .timestamp_nanos_opt()
+                .expect("Failed to convert timezone to nanoseconds")
+                / 1000,
+        }
+    }
+
     /// Creates a dead letter from bytes that failed deserialization.
     /// `json_string` will always be `None`.
     pub(crate) fn from_failed_deserialization(bytes: &[u8], err: String) -> Self {
@@ -137,7 +149,7 @@ pub(crate) struct DeadLetterQueueOptions {
     /// Table URI of the delta table to write dead letters to. Implies usage of the DeltaSinkDeadLetterQueue.
     pub delta_table_uri: Option<String>,
     /// A list of transforms to apply to dead letters before writing to delta.
-    pub dead_letter_transforms: HashMap<String, String>,
+    pub dead_letter_transforms: IndexMap<String, String>,
     /// Whether to write checkpoints on every 10th version of the dead letter table.
     pub write_checkpoints: bool,
 }
@@ -153,6 +165,7 @@ pub(crate) struct DeadLetterQueueOptions {
 #[async_trait]
 pub(crate) trait DeadLetterQueue: Send {
     /// Writes one [DeadLetter] to the [DeadLetterQueue].
+    #[allow(dead_code)]
     async fn write_dead_letter(
         &mut self,
         dead_letter: DeadLetter,
@@ -203,6 +216,7 @@ impl DeadLetterQueue for NoopDeadLetterQueue {
 /// Be mindful of your PII when using this implementation.
 pub(crate) struct LoggingDeadLetterQueue {}
 
+#[allow(dead_code)]
 #[async_trait]
 impl DeadLetterQueue for LoggingDeadLetterQueue {
     async fn write_dead_letters(
@@ -218,8 +232,6 @@ impl DeadLetterQueue for LoggingDeadLetterQueue {
 }
 
 /// Implementation of the [DeadLetterQueue] trait that writes dead letters to a delta table.
-/// NOTE: The delta table where dead letters are written must be created beforehand
-/// and be based on the [DeadLetter] struct.
 /// DeadLetter transforms may be specified to enrich the serialized [DeadLetter] before writing it to the table.
 ///
 /// For example, given a delta table schema created from:
@@ -243,21 +255,80 @@ pub(crate) struct DeltaSinkDeadLetterQueue {
     write_checkpoints: bool,
 }
 
+fn dead_letter_table_schema() -> Vec<StructField> {
+    let mut r = Vec::new();
+    r.push(StructField {
+        name: "base64_bytes".to_string(),
+        data_type: DataType::Primitive(PrimitiveType::String),
+        nullable: true,
+        metadata: HashMap::new(),
+    });
+    r.push(StructField {
+        name: "json_string".to_string(),
+        data_type: DataType::Primitive(PrimitiveType::String),
+        nullable: true,
+        metadata: HashMap::new(),
+    });
+    r.push(StructField {
+        name: "error".to_string(),
+        data_type: DataType::Primitive(PrimitiveType::String),
+        nullable: true,
+        metadata: HashMap::new(),
+    });
+    r.push(StructField {
+        name: "timestamp".to_string(),
+        data_type: DataType::Primitive(PrimitiveType::Timestamp),
+        nullable: false,
+        metadata: HashMap::new(),
+    });
+    r.push(StructField {
+        name: "date".to_string(),
+        data_type: DataType::Primitive(PrimitiveType::Date),
+        nullable: false,
+        metadata: HashMap::new(),
+    });
+    r
+}
+
 impl DeltaSinkDeadLetterQueue {
     pub(crate) async fn from_options(
         options: DeadLetterQueueOptions,
     ) -> Result<Self, DeadLetterQueueError> {
         match &options.delta_table_uri {
             Some(table_uri) => {
-                #[cfg(feature = "s3")]
                 let opts = hashmap! {
                     dynamo_lock_options::DYNAMO_LOCK_PARTITION_KEY_VALUE.to_string() => std::env::var(env_vars::DEAD_LETTER_DYNAMO_LOCK_PARTITION_KEY_VALUE)
                     .unwrap_or_else(|_| "kafka_delta_ingest-dead_letters".to_string()),
                 };
-                #[cfg(all(feature = "azure", not(feature = "s3")))]
-                let opts = HashMap::default();
+                // #[cfg(feature = "azure")]
+                // let opts = HashMap::default();
 
-                let table = crate::delta_helpers::load_table(table_uri, opts.clone()).await?;
+                let table = crate::delta_helpers::load_table(table_uri, opts.clone()).await;
+                let table = match table {
+                    Ok(table) => {
+                        info!("Loaded delta table from {}", table_uri);
+                        table
+                    }
+                    Err(DeltaTableError::NotATable(table_url)) => {
+                        error!("Table URI {} is not a delta table", table_url);
+                        // create table
+                        // let table = DeltaTable::create_table(table_uri, opts.clone()).await?;
+                        let columns = dead_letter_table_schema();
+                        let paritition_columns = vec!["date"];
+                        let table = deltalake_core::operations::create::CreateBuilder::new()
+                            .with_location(table_uri)
+                            .with_table_name("dead_letters")
+                            .with_columns(columns)
+                            .with_partition_columns(paritition_columns)
+                            .await?;
+                        table
+                    }
+                    Err(e) => {
+                        error!("Failed to load delta table from {}: {}", table_uri, e);
+                        return Err(DeadLetterQueueError::DeltaTable { source: e });
+                    }
+                };
+
                 let delta_writer = DataWriter::for_table(&table, opts)?;
 
                 Ok(Self {
@@ -294,14 +365,14 @@ impl DeadLetterQueue for DeltaSinkDeadLetterQueue {
             })
             .collect();
         let values = values?;
-
+        debug!("Writing Dead Letters to Table.");
         let version = self
             .delta_writer
             .insert_all(&mut self.table, values)
             .await?;
 
         if self.write_checkpoints {
-            crate::delta_helpers::try_create_checkpoint(&mut self.table, version).await?;
+            crate::delta_helpers::try_create_checkpoint(&mut self.table, version, None).await?;
         }
 
         info!(

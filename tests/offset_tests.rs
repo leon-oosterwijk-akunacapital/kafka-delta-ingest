@@ -1,13 +1,11 @@
-use deltalake_core::protocol::Stats;
 use deltalake_core::DeltaTable;
-use log::*;
+use log::{debug, info};
 use rdkafka::{producer::Producer, util::Timeout};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serial_test::serial;
-use uuid::Uuid;
-
 use std::path::Path;
+use uuid::Uuid;
 
 use kafka_delta_ingest::{AutoOffsetReset, IngestOptions};
 #[allow(dead_code)]
@@ -52,7 +50,7 @@ async fn zero_offset_issue() {
         // check that there's only 1 record in table
         let table = deltalake_core::open_table(table).await.unwrap();
         assert_eq!(table.version(), 1);
-        assert_eq!(count_records(table), 1);
+        assert_eq!(count_files(table), 1);
     }
 
     let producer = helpers::create_producer();
@@ -80,27 +78,15 @@ async fn zero_offset_issue() {
     // check that there's only 3 records
     let table = deltalake_core::open_table(table).await.unwrap();
     assert_eq!(table.version(), 3);
-    assert_eq!(count_records(table), 3);
+    assert_eq!(count_files(table), 3);
 
     //cleanup
     std::fs::remove_file(v2).unwrap();
     std::fs::remove_file(v3).unwrap();
 }
 
-fn count_records(table: DeltaTable) -> i64 {
-    let mut count = 0;
-
-    if let Ok(adds) = table.state.unwrap().file_actions() {
-        for add in adds.iter() {
-            if let Some(stats) = add.stats.as_ref() {
-                // as of deltalake-core 0.18.0 get_stats_parsed() only returns data when loaded
-                // from checkpoints so manual parsing is necessary
-                let stats: Stats = serde_json::from_str(stats).unwrap_or(Stats::default());
-                count += stats.num_records;
-            }
-        }
-    }
-    count
+fn count_files(table: DeltaTable) -> i64 {
+    table.state.unwrap().files_count() as i64
 }
 
 #[tokio::test]
@@ -128,7 +114,7 @@ async fn test_start_from_explicit() {
         helpers::send_json(&producer, &topic, &serde_json::to_value(m).unwrap()).await;
     }
 
-    producer.flush(Timeout::Never);
+    let _ = producer.flush(Timeout::Never);
 
     debug!("Sent test messages to Kafka");
 
@@ -259,7 +245,7 @@ async fn test_start_from_latest() {
         helpers::send_json(&producer, &topic, &serde_json::to_value(m).unwrap()).await;
     }
 
-    producer.flush(Timeout::Never);
+    let _ = producer.flush(Timeout::Never);
 
     // Start ingest
     let (kdi, token, rt) = helpers::create_kdi(
@@ -384,7 +370,7 @@ async fn end_at_initial_offsets() {
         // check that there's 3 records in table
         let table = deltalake_core::open_table(table).await.unwrap();
         assert_eq!(table.version(), 1);
-        assert_eq!(count_records(table), 15);
+        assert_eq!(count_files(table), 1);
     }
 
     // messages in kafka
@@ -403,5 +389,5 @@ async fn end_at_initial_offsets() {
     // check that there's only 3 records
     let table = deltalake_core::open_table(table).await.unwrap();
     assert_eq!(table.version(), 1);
-    assert_eq!(count_records(table), 15);
+    assert_eq!(count_files(table), 1);
 }

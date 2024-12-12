@@ -1,15 +1,13 @@
-#![cfg(feature = "s3")]
-
 #[allow(dead_code)]
 mod helpers;
 
+use indexmap::IndexMap;
+use serial_test::serial;
 use std::collections::HashMap;
 use std::env;
 use std::io::Read;
 use std::thread;
 use std::time::Duration;
-
-use serial_test::serial;
 use uuid::Uuid;
 
 use kafka_delta_ingest::IngestOptions;
@@ -96,7 +94,7 @@ fn create_options(name: &str) -> IngestOptions {
     let max_messages_per_batch = 10;
     let min_bytes_per_file = 370;
 
-    let mut transforms = HashMap::new();
+    let mut transforms = IndexMap::new();
     transforms.insert("date".to_string(), "substr(timestamp,`0`,`10`)".to_string());
     transforms.insert("_kafka_offset".to_string(), "kafka.offset".to_string());
 

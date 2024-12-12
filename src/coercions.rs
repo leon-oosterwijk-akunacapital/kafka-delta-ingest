@@ -1,6 +1,7 @@
 use deltalake_core::kernel::Schema as DeltaSchema;
 use deltalake_core::kernel::{DataType, PrimitiveType};
 
+use crate::EPOCH_DATE;
 use chrono::prelude::*;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -19,12 +20,15 @@ enum CoercionNode {
 enum Coercion {
     ToString,
     ToTimestamp,
+    ToDate,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CoercionTree {
     root: HashMap<String, CoercionNode>,
 }
+
+
 
 /// Returns a [`CoercionTree`] so the schema can be walked efficiently level by level when performing conversions.
 pub(crate) fn create_coercion_tree(schema: &DeltaSchema) -> CoercionTree {
@@ -44,6 +48,7 @@ fn build_coercion_node(data_type: &DataType) -> Option<CoercionNode> {
         DataType::Primitive(primitive) => match primitive {
             PrimitiveType::String => Some(CoercionNode::Coercion(Coercion::ToString)),
             PrimitiveType::Timestamp => Some(CoercionNode::Coercion(Coercion::ToTimestamp)),
+            PrimitiveType::Date => Some(CoercionNode::Coercion(Coercion::ToDate)),
             _ => None,
         },
         DataType::Struct(st) => {
@@ -84,6 +89,13 @@ fn apply_coercion(value: &mut Value, node: &CoercionNode) {
                 *value = Value::String(value.to_string());
             }
         }
+        CoercionNode::Coercion(Coercion::ToDate) => {
+            if let Some(as_str) = value.as_str() {
+                if let Some(parsed) = string_to_date(as_str) {
+                    *value = parsed
+                }
+            }
+        }
         CoercionNode::Coercion(Coercion::ToTimestamp) => {
             if let Some(as_str) = value.as_str() {
                 if let Some(parsed) = string_to_timestamp(as_str) {
@@ -113,13 +125,28 @@ fn apply_coercion(value: &mut Value, node: &CoercionNode) {
         CoercionNode::ArrayTree(tree) => {
             let values = value.as_array_mut();
             if let Some(values) = values {
-                let node = CoercionNode::Tree(tree.clone());
+                let node = CoercionNode::Tree(tree.clone()); // TODO: This is a clone. Can we avoid it?
                 for value in values {
                     apply_coercion(value, &node);
                 }
             }
         }
     }
+}
+
+fn string_to_date(string: &str) -> Option<Value> {
+    let parsed = NaiveDate::from_str(string);
+    if let Err(e) = parsed {
+        log::error!(
+            "Error coercing timestamp from string. String: {}. Error: {}",
+            string,
+            e
+        )
+    }
+    //log::info!("parsed: {:?}", parsed);
+    parsed
+        .ok()
+        .map(|nd: NaiveDate| Value::Number(nd.signed_duration_since(EPOCH_DATE).num_days().into()))
 }
 
 fn string_to_timestamp(string: &str) -> Option<Value> {

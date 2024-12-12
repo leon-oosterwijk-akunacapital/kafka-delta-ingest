@@ -12,7 +12,7 @@ use kafka_delta_ingest::IngestOptions;
 #[tokio::test]
 #[serial]
 async fn test_flush_when_latency_expires() {
-    let (topic, table, producer, kdi, token, rt) = helpers::create_and_run_kdi(
+    let (topic, base_uri, producer, kdi, token, rt) = helpers::create_and_run_kdi(
         "flush_when_latency_expires",
         json!({
             "id": "integer",
@@ -28,6 +28,7 @@ async fn test_flush_when_latency_expires() {
             max_messages_per_batch: 5000,
             // large value - avoid flushing on file size
             min_bytes_per_file: 1000000,
+            seconds_idle_kafka_read_before_flush: 1,
             kafka_brokers: helpers::test_broker(),
             ..Default::default()
         }),
@@ -39,8 +40,10 @@ async fn test_flush_when_latency_expires() {
         helpers::send_json(&producer, &topic, &serde_json::to_value(m).unwrap()).await;
     }
 
+    let table_uri = format!("{}/{}", base_uri, topic);
+
     // wait for latency flush
-    helpers::wait_until_version_created(&table, 1);
+    helpers::wait_until_version_created(&table_uri, 1);
 
     for m in create_generator(11).take(10) {
         info!("Writing test message");
@@ -48,10 +51,10 @@ async fn test_flush_when_latency_expires() {
     }
 
     // wait for latency flush
-    helpers::wait_until_version_created(&table, 2);
+    helpers::wait_until_version_created(&table_uri, 2);
 
-    let v1_rows: Vec<TestMsg> = helpers::read_table_content_at_version_as(&table, 1).await;
-    let v2_rows: Vec<TestMsg> = helpers::read_table_content_as(&table).await;
+    let v1_rows: Vec<TestMsg> = helpers::read_table_content_at_version_as(&table_uri, 1).await;
+    let v2_rows: Vec<TestMsg> = helpers::read_table_content_as(&table_uri).await;
 
     assert_eq!(v1_rows.len(), 10);
     assert_eq!(v2_rows.len(), 20);
@@ -64,7 +67,8 @@ async fn test_flush_when_latency_expires() {
 #[tokio::test]
 #[serial]
 async fn test_dont_write_an_empty_buffer() {
-    let (topic, table, producer, kdi, token, rt) = helpers::create_and_run_kdi(
+    let _ = env_logger::try_init();
+    let (topic, base_uri, producer, kdi, token, rt) = helpers::create_and_run_kdi(
         "dont_write_an_empty_buffer",
         json!({
             "id": "integer",
@@ -76,6 +80,7 @@ async fn test_dont_write_an_empty_buffer() {
             app_id: "dont_write_an_empty_buffer".to_string(),
             // buffer for 5 seconds before flush
             allowed_latency: 5,
+            seconds_idle_kafka_read_before_flush: 1,
             kafka_brokers: helpers::test_broker(),
             ..Default::default()
         }),
@@ -88,8 +93,11 @@ async fn test_dont_write_an_empty_buffer() {
         helpers::send_json(&producer, &topic, &serde_json::to_value(m).unwrap()).await;
     }
 
+    // construct table uri
+    let table_uri = format!("{}/{}", base_uri, topic);
+
     // wait for latency flush
-    helpers::wait_until_version_created(&table, 1);
+    helpers::wait_until_version_created(&table_uri, 1);
 
     // wait for the latency timer to trigger
     sleep(Duration::from_secs(6)).await;
@@ -97,7 +105,7 @@ async fn test_dont_write_an_empty_buffer() {
     // verify that an empty version _was not_ created.
     // i.e. we should still be at version 1
 
-    let t = deltalake_core::open_table(&table).await.unwrap();
+    let t = deltalake_core::open_table(&table_uri).await.unwrap();
 
     assert_eq!(1, t.version());
 
@@ -109,7 +117,7 @@ async fn test_dont_write_an_empty_buffer() {
 #[tokio::test]
 #[serial]
 async fn test_flush_on_size_without_latency_expiration() {
-    let (topic, table, producer, kdi, token, rt) = helpers::create_and_run_kdi(
+    let (topic, base_uri, producer, kdi, token, rt) = helpers::create_and_run_kdi(
         "flush_on_size_without_latency_expiration",
         json!({
             "id": "integer",
@@ -119,12 +127,14 @@ async fn test_flush_on_size_without_latency_expiration() {
         1,
         Some(IngestOptions {
             app_id: "flush_on_size_without_latency_expiration".to_string(),
+            seconds_idle_kafka_read_before_flush: 1,
             // buffer for an hour
             allowed_latency: 3600,
             // create a record batch when we have 10 messages
             max_messages_per_batch: 10,
             // tiny buffer size for write flush
             min_bytes_per_file: 20,
+
             kafka_brokers: helpers::test_broker(),
             ..Default::default()
         }),
@@ -136,9 +146,10 @@ async fn test_flush_on_size_without_latency_expiration() {
         helpers::send_json(&producer, &topic, &serde_json::to_value(m).unwrap()).await;
     }
 
-    helpers::wait_until_version_created(&table, 1);
+    let table_uri = format!("{}/{}", base_uri, topic);
+    helpers::wait_until_version_created(&table_uri, 1);
 
-    let data: Vec<TestMsg> = helpers::read_table_content_at_version_as(&table, 1).await;
+    let data: Vec<TestMsg> = helpers::read_table_content_at_version_as(&base_uri, 1).await;
 
     assert_eq!(data.len(), 10);
 

@@ -1,7 +1,6 @@
 use crate::delta_helpers::*;
 use crate::{DataTypeOffset, DataTypePartition};
 use deltalake_core::kernel::Action;
-use deltalake_core::operations::transaction::TableReference;
 use deltalake_core::protocol::DeltaOperation;
 use deltalake_core::protocol::OutputMode;
 use deltalake_core::{DeltaTable, DeltaTableError};
@@ -32,6 +31,7 @@ pub enum WriteOffsetsError {
 /// But, if stored offsets are lower then the `InconsistentStoredOffsets` is returned since it
 /// could break the data integrity.
 /// Hence, one is advised to supply the new `app_id` if skipping offsets is what required.
+#[allow(dead_code)]
 pub(crate) async fn write_offsets_to_delta(
     table: &mut DeltaTable,
     app_id: &str,
@@ -116,10 +116,11 @@ async fn commit_partition_offsets(
         .as_millis() as i64;
 
     table.update().await?;
-    let commit = deltalake_core::operations::transaction::CommitBuilder::default()
+
+    let action = deltalake_core::operations::transaction::CommitBuilder::default()
         .with_actions(actions)
         .build(
-            table.state.as_ref().map(|s| s as &dyn TableReference),
+            Some(table.snapshot()?),
             table.log_store().clone(),
             DeltaOperation::StreamingUpdate {
                 output_mode: OutputMode::Complete,
@@ -127,9 +128,8 @@ async fn commit_partition_offsets(
                 epoch_id,
             },
         )
-        .await
-        .map_err(DeltaTableError::from);
-    match commit {
+        .await;
+    match action {
         Ok(v) => {
             info!(
                 "Delta version {} completed with new txn offsets {}.",

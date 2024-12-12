@@ -1,3 +1,4 @@
+use indexmap::IndexMap;
 use kafka_delta_ingest::IngestOptions;
 use log::info;
 use serde::{Deserialize, Serialize};
@@ -8,9 +9,6 @@ use uuid::Uuid;
 
 #[allow(dead_code)]
 mod helpers;
-
-#[macro_use]
-extern crate maplit;
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 struct TestMsgNested {
@@ -37,15 +35,19 @@ async fn test_dlq() {
     let max_messages_per_batch = 6;
     let min_bytes_per_file = 20;
 
+    let mut dlq_transforms = IndexMap::new();
+    dlq_transforms.insert(
+        "date".to_string(),
+        "substr(epoch_micros_to_iso8601(timestamp),`0`,`10`)".to_string(),
+    );
+
     let (kdi, token, rt) = helpers::create_kdi(
         &data_topic,
         &table,
         IngestOptions {
             app_id: "dlq_test".to_string(),
             dlq_table_uri: Some(dlq_table.clone()),
-            dlq_transforms: hashmap! {
-                "date".to_string() => "substr(epoch_micros_to_iso8601(timestamp),`0`,`10`)".to_string(),
-            },
+            dlq_transforms,
             allowed_latency,
             max_messages_per_batch,
             min_bytes_per_file,

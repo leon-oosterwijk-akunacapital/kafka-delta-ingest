@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use serial_test::serial;
+use std::env;
 use std::fs::File;
 use std::io::prelude::*;
 
@@ -18,6 +19,25 @@ struct MsgV2 {
     id: u32,
     color: Option<String>,
     date: String,
+}
+
+#[tokio::test]
+#[serial]
+async fn test_check_s3_connections() {
+    let _ = env_logger::try_init();
+    // iterate through  list of AWS environment variables
+    for (key, val) in env::vars() {
+        if key.starts_with("AWS") {
+            print!("Found AWS environment variable: {} : {}", key, val);
+        }
+    }
+    let s3_path = "s3://tests".to_string();
+    let entries = kafka_delta_ingest::read_entries_from_s3(&s3_path, &None)
+        .await
+        .unwrap();
+    for entry in entries {
+        println!("{:?}", entry);
+    }
 }
 
 #[tokio::test]

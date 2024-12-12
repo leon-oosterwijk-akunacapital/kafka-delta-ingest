@@ -9,10 +9,6 @@ endif::[]
 
 = Hacking on kafka-delta-ingest
 
-kafka-delta-ingest is designed to work well with AWS and Azure, which can add
-some complexity to the development environment. This document outlines how to
-work with kafka-delta-ingest locally for new and existing Rust developers.
-
 toc::[]
 
 == Developing

@@ -16,7 +16,6 @@ use deltalake_core::parquet::{
 };
 use deltalake_core::storage::ObjectStoreRef;
 use deltalake_core::{DeltaTable, Path};
-use kafka_delta_ingest::{start_ingest, IngestOptions};
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
 use rdkafka::producer::{FutureProducer, FutureRecord};
@@ -28,6 +27,8 @@ use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+use kafka_delta_ingest::{start_parallel_ingest, IngestOptions};
 
 /*
  * Return the KAFKA_BROKERS set in the environment or default ot the local machine's port 9092
@@ -110,11 +111,14 @@ pub async fn send_bytes(producer: &FutureProducer, topic: &str, bytes: &Vec<u8>)
 // TODO Research whether it's possible to read parquet data from bytes but not from file
 pub async fn read_files_from_store(table: &DeltaTable) -> Vec<i32> {
     let s3 = table.object_store().clone();
-    let paths = table.get_files_iter().unwrap();
+    let paths = table
+        .get_files_iter()
+        .expect("Failed to get files for table.");
     let tmp = format!(".test-{}.tmp", Uuid::new_v4());
     let mut list = Vec::new();
 
     for path in paths {
+        let path: Path = path;
         let get_result = s3.get(&path).await.unwrap();
         let bytes = get_result.bytes().await.unwrap();
         {
@@ -200,8 +204,8 @@ pub async fn cleanup_kdi(topic: &str, table: &str) {
 
 pub async fn create_and_run_kdi(
     app_id: &str,
-    schema: Value,
-    delta_partitions: Vec<&str>,
+    _schema: Value,
+    _delta_partitions: Vec<&str>,
     kafka_num_partitions: i32,
     opts: Option<IngestOptions>,
 ) -> (
@@ -214,12 +218,11 @@ pub async fn create_and_run_kdi(
 ) {
     init_logger();
 
-    #[cfg(feature = "s3")]
     deltalake_aws::register_handlers(None);
-    #[cfg(feature = "azure")]
-    deltalake_azure::register_handlers(None);
     let topic = format!("{}-{}", app_id, Uuid::new_v4());
-    let table = create_local_table(schema, delta_partitions, &topic);
+    // let table = create_local_table(schema, delta_partitions, &topic);
+    let path_uri = format!("./tests/data/gen/{}", Uuid::new_v4());
+    std::fs::create_dir_all(FilePath::new(&path_uri).parent().unwrap()).unwrap();
     create_topic(&topic, kafka_num_partitions).await;
 
     let opts = opts
@@ -231,13 +234,15 @@ pub async fn create_and_run_kdi(
             app_id: app_id.to_string(),
             allowed_latency: 10,
             max_messages_per_batch: 1,
+            table_base_uri: "s3://tests/delta/".to_string(),
+            seconds_idle_kafka_read_before_flush: 5,
             min_bytes_per_file: 20,
             ..IngestOptions::default()
         });
 
-    let (kdi, token, rt) = create_kdi(&topic, &table, opts);
+    let (kdi, token, rt) = create_kdi(&topic, &path_uri, opts);
     let producer = create_producer();
-    (topic, table, producer, kdi, token, rt)
+    (topic, path_uri, producer, kdi, token, rt)
 }
 
 pub fn create_local_table(schema: Value, partitions: Vec<&str>, table_name: &str) -> String {
@@ -289,7 +294,7 @@ pub fn create_kdi_with(
         let topic = topic.to_string();
         let table = table.to_string();
         rt.spawn(async move {
-            start_ingest(topic, table, options, token.clone())
+            start_parallel_ingest(topic, table, options, Some(token))
                 .await
                 .unwrap()
         })
@@ -364,6 +369,7 @@ pub fn wait_until_file_created(path: &FilePath) {
 
 pub fn wait_until_version_created(table: &str, version: i64) {
     let path = format!("{}/_delta_log/{:020}.json", table, version);
+    println!("Waiting for file: {}", path);
     wait_until_file_created(FilePath::new(&path));
 }
 
@@ -422,17 +428,12 @@ pub async fn read_table_content_at_version_as_jsons(table_uri: &str, version: i6
 async fn json_listify_table_content(table: DeltaTable, store: ObjectStoreRef) -> Vec<Value> {
     let tmp = format!(".test-{}.tmp", Uuid::new_v4());
     let mut list = Vec::new();
-    // XXX :confused: why is this reversed in 0.18+
     for file in table
         .get_files_iter()
-        .unwrap()
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
+        .expect("Failed to get files for table.")
     {
         let get_result = store.get(&file).await.unwrap();
         let bytes = get_result.bytes().await.unwrap();
-        // lol what is this
         let mut file = File::create(&tmp).unwrap();
         file.write_all(bytes.chunk()).unwrap();
         drop(file);
@@ -478,8 +479,8 @@ pub async fn inspect_table(path: &str) {
                     println!("  Txn: {}: {}", t.app_id, t.version)
                 }
                 Action::Add(a) => {
-                    let stats = a.get_stats_parsed().unwrap().unwrap();
-                    println!("  Add: {}. Records: {}", &a.path, stats.num_records);
+                    let stats = a.stats.unwrap();
+                    println!("  Add: {}. Records: {}", &a.path, stats);
                     let full_path = format!("{}/{}", &path, &a.path);
                     let parquet_bytes = store
                         .get(&Path::parse(&full_path).unwrap())
@@ -530,13 +531,14 @@ pub async fn inspect_table(path: &str) {
                     println!(" {}. remove: {}", i, r.path);
                 }
                 if let Some(a) = parse_json_field::<Add>(&json, "add") {
-                    let records = a
-                        .get_stats_parsed()
-                        .ok()
-                        .flatten()
-                        .map(|s| s.num_records)
-                        .unwrap_or(-1);
-                    println!(" {}. add[{}]: {}", i, records, a.path);
+                    let stats = a.stats.unwrap();
+                    // let records = a
+                    //     .stats
+                    //     .ok()
+                    //     .flatten()
+                    //     .map(|s| s.num_records)
+                    //     .unwrap_or(-1);
+                    println!(" {}. add[{}]: {}", i, stats, a.path);
                 }
 
                 i += 1;
@@ -602,7 +604,7 @@ impl TestScope {
         let token = self.workers_token.clone();
         let options = self.options.clone();
         rt.spawn(async move {
-            let res = start_ingest(topic, table, options, token.clone()).await;
+            let res = start_parallel_ingest(topic, table, options, Some(token.clone())).await;
             res.unwrap_or_else(|e| println!("AN ERROR OCCURED: {}", e));
             println!("Ingest process exited");
 
@@ -637,8 +639,7 @@ impl TestScope {
                 total += table
                     .get_app_transaction_version()
                     .get(key)
-                    .map(|txn| txn.version)
-                    .unwrap_or(0);
+                    .map_or(0, |t| t.version);
             }
 
             if total >= expected_total as i64 {

@@ -1,11 +1,11 @@
 use chrono::prelude::*;
+use indexmap::IndexMap;
 use jmespatch::{
     functions::{ArgumentType, CustomFunction, Signature},
     Context, ErrorReason, Expression, JmespathError, Rcvar, Runtime, RuntimeError, Variable,
 };
 use rdkafka::Message;
 use serde_json::{Map, Value};
-use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::sync::Arc;
 
@@ -72,6 +72,8 @@ lazy_static! {
         let mut runtime = Runtime::new();
         runtime.register_builtin_functions();
         runtime.register_function("substr", Box::new(create_substr_fn()));
+        runtime.register_function("now_epoch_seconds", Box::new(create_now_epoch_seconds_fn()));
+
         runtime.register_function(
             "epoch_seconds_to_iso8601",
             Box::new(create_epoch_seconds_to_iso8601_fn()),
@@ -80,12 +82,20 @@ lazy_static! {
             "epoch_micros_to_iso8601",
             Box::new(create_epoch_micros_to_iso8601_fn()),
         );
+        runtime.register_function(
+            "epoch_nanos_to_iso8601",
+            Box::new(create_epoch_nanos_to_iso8601_fn()),
+        );
+        runtime.register_function(
+            "epoch_millis_to_iso8601",
+            Box::new(create_epoch_millis_to_iso8601_fn()),
+        );
         runtime
     };
 }
 
 fn compile_transforms(
-    definitions: &HashMap<String, String>,
+    definitions: &IndexMap<String, String>,
 ) -> Result<Vec<(ValuePath, MessageTransform)>, TransformError> {
     let mut transforms = Vec::new();
 
@@ -190,6 +200,24 @@ fn create_epoch_micros_to_iso8601_fn() -> CustomFunction {
         Box::new(jmespath_epoch_micros_to_iso8601),
     )
 }
+fn create_epoch_nanos_to_iso8601_fn() -> CustomFunction {
+    CustomFunction::new(
+        Signature::new(vec![ArgumentType::Number], None),
+        Box::new(jmespath_epoch_nanos_to_iso8601),
+    )
+}
+fn create_epoch_millis_to_iso8601_fn() -> CustomFunction {
+    CustomFunction::new(
+        Signature::new(vec![ArgumentType::Number], None),
+        Box::new(jmespath_epoch_millis_to_iso8601),
+    )
+}
+fn create_now_epoch_seconds_fn() -> CustomFunction {
+    CustomFunction::new(
+        Signature::new(vec![], None),
+        Box::new(jmespath_now_epoch_seconds),
+    )
+}
 
 fn substr(args: &[Rcvar], context: &mut Context) -> Result<Rcvar, JmespathError> {
     let s = args[0].as_string().ok_or_else(|| {
@@ -246,6 +274,38 @@ fn jmespath_epoch_micros_to_iso8601(
     Ok(Arc::new(variable))
 }
 
+fn jmespath_epoch_millis_to_iso8601(
+    args: &[Rcvar],
+    context: &mut Context,
+) -> Result<Rcvar, JmespathError> {
+    let millis = i64_from_args(args, context, 0)?;
+    let value =
+        serde_json::Value::String(iso8601_from_epoch(EpochUnit::Microseconds(millis * 1000)));
+    let variable = Variable::try_from(value)?;
+    Ok(Arc::new(variable))
+}
+
+fn jmespath_epoch_nanos_to_iso8601(
+    args: &[Rcvar],
+    context: &mut Context,
+) -> Result<Rcvar, JmespathError> {
+    let nanos = i64_from_args(args, context, 0)?;
+    let value =
+        serde_json::Value::String(iso8601_from_epoch(EpochUnit::Microseconds(nanos / 1000)));
+    let variable = Variable::try_from(value)?;
+    Ok(Arc::new(variable))
+}
+
+fn jmespath_now_epoch_seconds(
+    _args: &[Rcvar],
+    _context: &mut Context,
+) -> Result<Rcvar, JmespathError> {
+    let seconds_since_epoch = Utc::now().timestamp();
+    let value = serde_json::Value::Number(serde_json::Number::from(seconds_since_epoch));
+    let variable = Variable::try_from(value)?;
+    Ok(Arc::new(variable))
+}
+
 fn i64_from_args(
     args: &[Rcvar],
     context: &mut Context,
@@ -264,7 +324,7 @@ fn i64_from_args(
 
     Ok(n)
 }
-
+#[derive(Debug, Clone)]
 enum KafkaMetaProperty {
     Partition,
     Offset,
@@ -273,11 +333,13 @@ enum KafkaMetaProperty {
     TimestampType,
 }
 
+#[derive(Debug, Clone)]
 enum MessageTransform {
     KafkaMetaTransform(KafkaMetaProperty),
     ExpressionTransform(Expression<'static>),
 }
 
+#[derive(Debug, Clone)]
 struct ValuePath {
     parts: Vec<String>,
 }
@@ -301,14 +363,18 @@ impl ValuePath {
 fn set_value(object: &mut Map<String, Value>, path: &ValuePath, path_index: usize, value: Value) {
     match value {
         // Don't set if the extracted value is null.
-        Value::Null => { /* noop */ }
+        //Value::Null => { /* noop */ }
         _ => {
             let part = path.part_at(path_index);
 
             if let Some(property) = part {
                 if path_index == path.len() - 1 {
                     // this is the leaf property - set value on the current object in context.
-                    object.insert(property.to_string(), value);
+                    if value == Value::Null {
+                        object.remove(property);
+                    } else {
+                        object.insert(property.to_string(), value);
+                    }
                 } else if let Some(next_o) =
                     object.get_mut(property).and_then(|v| v.as_object_mut())
                 {
@@ -329,6 +395,7 @@ fn set_value(object: &mut Map<String, Value>, path: &ValuePath, path_index: usiz
 }
 
 /// Transforms JSON values deserialized from a Kafka topic.
+#[derive(Debug, Clone)]
 pub(crate) struct Transformer {
     transforms: Vec<(ValuePath, MessageTransform)>,
 }
@@ -338,7 +405,7 @@ impl Transformer {
     ///
     /// Transforms should be provided as a HashMap where the key is the property the transformed value should be assigned to
     /// and the value is the JMESPath query expression or well known Kafka metadata property to assign.
-    pub fn from_transforms(transforms: &HashMap<String, String>) -> Result<Self, TransformError> {
+    pub fn from_transforms(transforms: &IndexMap<String, String>) -> Result<Self, TransformError> {
         let transforms = compile_transforms(transforms)?;
 
         Ok(Self { transforms })
@@ -354,11 +421,12 @@ impl Transformer {
     where
         M: Message,
     {
-        let data = Variable::try_from(value.clone())?;
-
+        let data = Variable::try_from(value.clone())?; // Todo: Can we fix this clone?
+                                                       //log::info!("About to transform: {:?}", value);
         match value.as_object_mut() {
             Some(map) => {
                 for (value_path, message_transform) in self.transforms.iter() {
+                    //log::info!("applying transform: {:?} to path: {:?}", message_transform, value_path);
                     match message_transform {
                         MessageTransform::ExpressionTransform(expression) => {
                             apply_expression_transform(map, &data, value_path, expression)?;
@@ -392,6 +460,8 @@ fn apply_expression_transform(
 ) -> Result<(), TransformError> {
     let variable = expression.search(message_variable)?;
     let v = serde_json::to_value(variable)?;
+    //log::info!("applying expression set: {:?} to path: {:?}", v, value_path);
+
     set_value(object_mut, value_path, 0, v);
     Ok(())
 }
@@ -435,10 +505,12 @@ fn timestamp_value_from_kafka(
 
 #[cfg(test)]
 mod tests {
+    use indexmap::IndexMap;
     use rdkafka::message::OwnedMessage;
+    use std::io::Read;
 
     use super::*;
-    use serde_json::json;
+    use serde_json::{json, to_string_pretty};
 
     #[test]
     fn substr_returns_will_from_william() {
@@ -525,7 +597,7 @@ mod tests {
             None,
         );
 
-        let mut transforms = HashMap::new();
+        let mut transforms = IndexMap::new();
 
         transforms.insert(
             "modified_date".to_string(),
@@ -585,7 +657,7 @@ mod tests {
             None,
         );
 
-        let mut transforms = HashMap::new();
+        let mut transforms = IndexMap::new();
         transforms.insert(
             "iso8601_from_float".to_string(),
             "epoch_seconds_to_iso8601(epoch_seconds_float)".to_string(),
@@ -602,13 +674,17 @@ mod tests {
             "iso8601_from_int_string".to_string(),
             "epoch_seconds_to_iso8601(to_number(epoch_seconds_int_string))".to_string(),
         );
+        transforms.insert("now_string".to_string(), "now_epoch_seconds()".to_string());
 
         let transformer = Transformer::from_transforms(&transforms).unwrap();
+
+        let now_orig_seconds = Utc::now().timestamp();
 
         transformer
             .transform(&mut test_value, Some(&test_message))
             .unwrap();
 
+        print!("transformed to: {}", test_value);
         let name = test_value.get("name").unwrap().as_str().unwrap();
         let iso8601_from_float = test_value
             .get("iso8601_from_float")
@@ -630,12 +706,14 @@ mod tests {
             .unwrap()
             .as_str()
             .unwrap();
+        let now = test_value.get("now_string").unwrap().as_i64().unwrap();
 
         assert_eq!("A", name);
         assert_eq!(expected_iso, iso8601_from_float);
         assert_eq!(expected_iso, iso8601_from_int);
         assert_eq!(expected_iso, iso8601_from_float_string);
         assert_eq!(expected_iso, iso8601_from_int_string);
+        assert_eq!(now_orig_seconds, now);
     }
 
     #[test]
@@ -655,7 +733,7 @@ mod tests {
             None,
         );
 
-        let mut transforms = HashMap::new();
+        let mut transforms = IndexMap::new();
 
         transforms.insert("_kafka_offset".to_string(), "kafka.offset".to_string());
         transforms.insert(
@@ -706,5 +784,134 @@ mod tests {
         assert_eq!("test", kafka_topic);
         assert_eq!(1626823098519000, kafka_timestamp);
         assert_eq!(0, kafka_timestamp_type);
+    }
+
+    #[test]
+    fn test_transform_array_flatten() {
+        let mut test_value = json!({
+          "bids": [
+            {
+              "count": 3,
+              "price": 10925,
+              "total_size": 450
+            },
+            {
+              "count": 2,
+              "price": 10920,
+              "total_size": 50
+            },
+            {
+              "count": 1,
+              "price": 10915,
+              "total_size": 25
+            },
+            {
+              "count": 1,
+              "price": 10900,
+              "total_size": 100
+            },
+            {
+              "count": 1,
+              "price": 10885,
+              "total_size": 25
+            }
+          ],
+          "book_builder_processing_ts": 1806,
+          "capture_ts": 634,
+          "channel": 10,
+          "channel_seq_id": 130755,
+          "id_context_id_sub_id": 67956,
+          "id_context_id_uuid": "b800aa93-c834-4033-8627-eef4365879d6",
+          "id_seq_num": 130755,
+          "offers": [
+            {
+              "count": 2,
+              "price": 11035,
+              "total_size": 75
+            },
+            {
+              "count": 1,
+              "price": 11040,
+              "total_size": 25
+            },
+            {
+              "count": 1,
+              "price": 11045,
+              "total_size": 25
+            },
+            {
+              "count": 1,
+              "price": 11060,
+              "total_size": 250
+            },
+            {
+              "count": 1,
+              "price": 11070,
+              "total_size": 25
+            }
+          ],
+          "security_id": 67956,
+          "timestamp": 0634,
+          "transact_ts": 1448
+        }
+                );
+
+        let test_message = OwnedMessage::new(
+            Some(test_value.to_string().into_bytes()),
+            None,
+            "test".to_string(),
+            rdkafka::Timestamp::CreateTime(1626823098519),
+            0,
+            0,
+            None,
+        );
+
+        // let mut transforms = HashMap::new();
+        let mut transforms = IndexMap::new();
+
+        transforms.insert("bid_0_px".to_string(), "bids[0].price".to_string());
+        transforms.insert("bid_0_qty".to_string(), "bids[0].total_size".to_string());
+        transforms.insert("bid_1_px".to_string(), "bids[1].price".to_string());
+        transforms.insert("bid_1_qty".to_string(), "bids[1].total_size".to_string());
+        transforms.insert("bid_2_px".to_string(), "bids[2].price".to_string());
+        transforms.insert("bid_2_qty".to_string(), "bids[2].total_size".to_string());
+        transforms.insert("bid_3_px".to_string(), "bids[3].price".to_string());
+        transforms.insert("bid_3_qty".to_string(), "bids[3].total_size".to_string());
+        transforms.insert("bid_4_px".to_string(), "bids[4].price".to_string());
+        transforms.insert("bid_4_qty".to_string(), "bids[4].total_size".to_string());
+        transforms.insert("ask_0_px".to_string(), "offers[0].price".to_string());
+        transforms.insert("ask_0_qty".to_string(), "offers[0].total_size".to_string());
+        transforms.insert("ask_1_px".to_string(), "offers[1].price".to_string());
+        transforms.insert("ask_1_qty".to_string(), "offers[1].total_size".to_string());
+        transforms.insert("ask_2_px".to_string(), "offers[2].price".to_string());
+        transforms.insert("ask_2_qty".to_string(), "offers[2].total_size".to_string());
+        transforms.insert("ask_3_px".to_string(), "offers[3].price".to_string());
+        transforms.insert("ask_3_qty".to_string(), "offers[3].total_size".to_string());
+        transforms.insert("ask_4_px".to_string(), "offers[4].price".to_string());
+        transforms.insert("ask_4_qty".to_string(), "offers[4].total_size".to_string());
+        transforms.insert("bids".to_string(), "null".to_string());
+        transforms.insert("offers".to_string(), "null".to_string());
+        transforms.insert("id_context_id_uuid".to_string(), "null".to_string());
+
+        let transformer = Transformer::from_transforms(&transforms).unwrap();
+
+        transformer
+            .transform(&mut test_value, Some(&test_message))
+            .unwrap();
+
+        let deserialized = to_string_pretty(&test_value).unwrap();
+        //println!("deserialized: {}", deserialized);
+
+        let expected_file =
+            std::fs::File::open("tests/data/transform_test_transform_array_flatten.json")
+                .expect("Unable to open file");
+        let mut reader = std::io::BufReader::new(expected_file);
+        let mut buffer = Vec::new();
+        reader
+            .read_to_end(&mut buffer)
+            .expect("Unable to read file");
+        let expected = std::str::from_utf8(&buffer).unwrap();
+
+        assert_eq!(deserialized, expected.trim());
     }
 }

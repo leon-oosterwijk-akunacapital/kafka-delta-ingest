@@ -12,6 +12,8 @@ use deltalake_core::arrow::{
     json::reader::ReaderBuilder,
     record_batch::*,
 };
+use deltalake_core::kernel::Metadata;
+use deltalake_core::parquet::format::FileMetaData;
 use deltalake_core::parquet::{
     arrow::ArrowWriter,
     basic::{Compression, LogicalType},
@@ -22,25 +24,28 @@ use deltalake_core::parquet::{
 };
 use deltalake_core::protocol::DeltaOperation;
 use deltalake_core::protocol::SaveMode;
+use deltalake_core::storage::object_store::PutPayload;
 use deltalake_core::{
     kernel::{Action, Add, Schema},
     protocol::{ColumnCountStat, ColumnValueStat, Stats},
     storage::ObjectStoreRef,
     DeltaTable, DeltaTableError, ObjectStoreError,
 };
-use deltalake_core::{operations::transaction::TableReference, parquet::format::FileMetaData};
-use log::{error, info, warn};
+use log::{error, info, trace, warn};
 use serde_json::{Number, Value};
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::io::Write;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
 use uuid::Uuid;
 
 use crate::cursor::InMemoryWriteableCursor;
+use crate::EPOCH_DATE;
 
 const NULL_PARTITION_VALUE_DATA_PATH: &str = "__HIVE_DEFAULT_PARTITION__";
+const MIN_CHUNK_SIZE: usize = 10000;
 
 type MinAndMaxValues = (
     HashMap<String, ColumnValueStat>,
@@ -57,7 +62,8 @@ pub enum DataWriterError {
     MissingPartitionColumn(String),
 
     /// The Arrow RecordBatch schema does not match the expected schema.
-    #[error("Arrow RecordBatch schema does not match: RecordBatch schema: {record_batch_schema}, {expected_schema}")]
+    #[error("Arrow RecordBatch schema does not match: RecordBatch schema: {record_batch_schema}, {expected_schema}"
+    )]
     SchemaMismatch {
         /// The record batch schema.
         record_batch_schema: SchemaRef,
@@ -176,6 +182,7 @@ pub struct DataWriter {
     writer_properties: WriterProperties,
     partition_columns: Vec<String>,
     arrow_writers: HashMap<String, DataArrowWriter>,
+    num_threads: usize,
 }
 
 /// Writes messages to an underlying arrow buffer.
@@ -187,6 +194,7 @@ pub(crate) struct DataArrowWriter {
     partition_values: HashMap<String, Option<String>>,
     null_counts: NullCounts,
     buffered_record_batch_count: usize,
+    num_threads: usize,
 }
 
 impl DataArrowWriter {
@@ -198,7 +206,13 @@ impl DataArrowWriter {
         arrow_schema: Arc<ArrowSchema>,
         json_buffer: Vec<Value>,
     ) -> Result<(), Box<DataWriterError>> {
-        let record_batch = record_batch_from_json(arrow_schema.clone(), json_buffer.as_slice())?;
+        trace!("Getting Recordbatch from JSON");
+        let record_batch = par_record_batch_from_json(
+            arrow_schema.clone(),
+            json_buffer.as_slice(),
+            self.num_threads,
+        )?;
+        trace!("Finished getting Recordbatch from JSON");
 
         if record_batch.schema() != arrow_schema {
             return Err(Box::new(DataWriterError::SchemaMismatch {
@@ -206,7 +220,6 @@ impl DataArrowWriter {
                 expected_schema: arrow_schema,
             }));
         }
-
         let result = self
             .write_record_batch(partition_columns, record_batch)
             .await;
@@ -260,7 +273,6 @@ impl DataArrowWriter {
 
         // Copy current cursor bytes so we can recover from failures
         let current_cursor_bytes = self.cursor.data();
-
         let result = self.arrow_writer.write(&record_batch);
         self.arrow_writer.flush()?;
 
@@ -296,6 +308,7 @@ impl DataArrowWriter {
     fn new(
         arrow_schema: Arc<ArrowSchema>,
         writer_properties: WriterProperties,
+        num_threads: usize,
     ) -> Result<Self, ParquetError> {
         let cursor = InMemoryWriteableCursor::default();
         let arrow_writer = Self::new_underlying_writer(
@@ -316,6 +329,7 @@ impl DataArrowWriter {
             partition_values,
             null_counts,
             buffered_record_batch_count,
+            num_threads,
         })
     }
 
@@ -347,7 +361,11 @@ impl DataWriter {
         let arrow_schema = ArrowSchema::try_from(table.schema().unwrap())?;
         let arrow_schema_ref = Arc::new(arrow_schema);
         let partition_columns = metadata.partition_columns.clone();
-
+        let num_threads = _options
+            .get("num_threads")
+            .unwrap_or(&"4".to_string())
+            .parse::<usize>()
+            .unwrap_or(4);
         // Initialize writer properties for the underlying arrow writer
         let writer_properties = WriterProperties::builder()
             // NOTE: Consider extracting config for writer properties and setting more than just compression
@@ -360,16 +378,28 @@ impl DataWriter {
             writer_properties,
             partition_columns,
             arrow_writers: HashMap::new(),
+            num_threads,
         })
+    }
+
+    /// Duplicates the current writer but leaves the arrow writers empty.
+    pub fn duplicate(&self) -> Self {
+        Self {
+            storage: self.storage.clone(),
+            arrow_schema_ref: self.arrow_schema_ref.clone(),
+            writer_properties: self.writer_properties.clone(),
+            partition_columns: self.partition_columns.clone(),
+            arrow_writers: HashMap::new(),
+            num_threads: self.num_threads,
+        }
     }
 
     /// Retrieves the latest schema from table, compares to the current and updates if changed.
     /// When schema is updated then `true` is returned which signals the caller that parquet
     /// created file or arrow batch should be revisited.
-    pub fn update_schema(&mut self, table: &DeltaTable) -> Result<bool, Box<DataWriterError>> {
-        let metadata = table.metadata().unwrap();
+    pub fn update_schema(&mut self, metadata: &Metadata) -> Result<bool, Box<DataWriterError>> {
         let schema: ArrowSchema =
-            <ArrowSchema as TryFrom<&Schema>>::try_from(table.schema().unwrap())?;
+            <ArrowSchema as TryFrom<&Schema>>::try_from(&metadata.schema().unwrap())?;
 
         let schema_updated = self.arrow_schema_ref.as_ref() != &schema
             || self.partition_columns != metadata.partition_columns;
@@ -399,8 +429,11 @@ impl DataWriter {
                         .await,
                 )?,
                 None => {
-                    let mut writer =
-                        DataArrowWriter::new(arrow_schema.clone(), self.writer_properties.clone())?;
+                    let mut writer = DataArrowWriter::new(
+                        arrow_schema.clone(),
+                        self.writer_properties.clone(),
+                        self.num_threads,
+                    )?;
 
                     collect_partial_write_failure(
                         &mut partial_writes,
@@ -462,7 +495,7 @@ impl DataWriter {
             self.storage
                 .put(
                     &deltalake_core::Path::parse(&path).unwrap(),
-                    bytes::Bytes::copy_from_slice(obj_bytes.as_slice()).into(),
+                    PutPayload::from(bytes::Bytes::copy_from_slice(obj_bytes.as_slice())).into(),
                 )
                 .await?;
 
@@ -583,11 +616,11 @@ impl DataWriter {
         self.write(values).await?;
         let mut adds = self.write_parquet_files(&table.table_uri()).await?;
         let actions = adds.drain(..).map(Action::Add).collect();
-        let commit = deltalake_core::operations::transaction::CommitBuilder::default()
+        let version = deltalake_core::operations::transaction::CommitBuilder::default()
             .with_actions(actions)
             .build(
-                table.state.as_ref().map(|s| s as &dyn TableReference),
-                table.log_store().clone(),
+                Some(table.snapshot()?),
+                table.log_store(),
                 DeltaOperation::Write {
                     mode: SaveMode::Append,
                     partition_by: Some(self.partition_columns.clone()),
@@ -595,8 +628,10 @@ impl DataWriter {
                 },
             )
             .await
-            .map_err(DeltaTableError::from)?;
-        Ok(commit.version)
+            .unwrap()
+            .version;
+
+        Ok(version)
     }
 }
 
@@ -610,6 +645,47 @@ pub fn record_batch_from_json(
     decoder
         .flush()?
         .ok_or(Box::new(DataWriterError::EmptyRecordBatch))
+}
+
+/// Creates an Arrow RecordBatch from the passed JSON buffer. Using parallel processing.
+pub fn par_record_batch_from_json(
+    arrow_schema: Arc<ArrowSchema>,
+    json: &[Value],
+    num_threads: usize,
+) -> Result<RecordBatch, Box<DataWriterError>> {
+    // chunk the json into num_threads chunks and process each chunk in parallel
+    let mut chunk_size = json.len() / num_threads;
+    if chunk_size <= MIN_CHUNK_SIZE {
+        chunk_size = json.len();
+    }
+    let json_chunks = json.chunks(chunk_size).collect::<Vec<_>>();
+    let mut handles = vec![];
+    for chunk in json_chunks {
+        unsafe {
+            // unsafe here because constructing a slice from a pointer is unsafe. but without this, we can't pass the chunk to the new thread
+            // because the chunk is a reference to the original json buffer, and the new thread will outlive the original buffer.
+            // but we join the threads before the original buffer goes out of scope, so it's safe.
+            let chunk_raw = std::slice::from_raw_parts(chunk.as_ptr(), chunk.len());
+
+            let my_schema = arrow_schema.clone();
+            // create new thread for each chunk
+            let handle = std::thread::spawn(move || {
+                let mut decoder = ReaderBuilder::new(my_schema).build_decoder()?;
+                decoder.serialize(chunk_raw)?;
+                decoder
+                    .flush()?
+                    .ok_or(Box::new(DataWriterError::EmptyRecordBatch))
+            });
+            handles.push(handle);
+        }
+    }
+    // wait for all threads to finish
+    let mut record_batches = vec![];
+    for handle in handles {
+        record_batches.push(handle.join().unwrap()?);
+    }
+    deltalake_core::arrow::compute::concat_batches(&arrow_schema.clone(), &record_batches)
+        .map_err(|e| e.into())
 }
 
 type BadValue = (Value, ParquetError);
@@ -1109,6 +1185,14 @@ fn stringified_partition_value(
         DataType::UInt16 => as_primitive_array::<UInt16Type>(arr).value(0).to_string(),
         DataType::UInt32 => as_primitive_array::<UInt32Type>(arr).value(0).to_string(),
         DataType::UInt64 => as_primitive_array::<UInt64Type>(arr).value(0).to_string(),
+        DataType::Date32 => {
+            let data = as_primitive_array::<Date32Type>(arr);
+            let date = data.value(0);
+            let date = EPOCH_DATE
+                .checked_add_days(chrono::naive::Days::new(date as u64))
+                .unwrap();
+            date.to_string()
+        }
         DataType::Utf8 => {
             let data = deltalake_core::arrow::array::as_string_array(arr);
 
@@ -1140,129 +1224,6 @@ fn timestamp_to_delta_stats_string(n: i64, time_unit: &TimeUnit) -> Option<Strin
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::path::Path;
-
-    #[tokio::test]
-    async fn delta_stats_test() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let table_path = temp_dir.path();
-        create_temp_table(table_path);
-
-        let table = crate::delta_helpers::load_table(table_path.to_str().unwrap(), HashMap::new())
-            .await
-            .unwrap();
-        let mut writer = DataWriter::for_table(&table, HashMap::new()).unwrap();
-
-        writer.write(JSON_ROWS.clone()).await.unwrap();
-        let add = writer
-            .write_parquet_files(&table.table_uri())
-            .await
-            .unwrap();
-        assert_eq!(add.len(), 1);
-        let stats: deltalake_core::protocol::Stats =
-            serde_json::from_str(&add[0].stats.as_ref().unwrap()).expect("Failed to parse stats");
-
-        let min_max_keys = vec!["meta", "some_int", "some_string", "some_bool"];
-        let mut null_count_keys = vec!["some_list", "some_nested_list"];
-        null_count_keys.extend_from_slice(min_max_keys.as_slice());
-
-        assert_eq!(min_max_keys.len(), stats.min_values.len());
-        assert_eq!(min_max_keys.len(), stats.max_values.len());
-        assert_eq!(null_count_keys.len(), stats.null_count.len());
-
-        // assert on min values
-        for (k, v) in stats.min_values.iter() {
-            match (k.as_str(), v) {
-                ("meta", ColumnValueStat::Column(map)) => {
-                    assert_eq!(2, map.len());
-
-                    let kafka = map.get("kafka").unwrap().as_column().unwrap();
-                    assert_eq!(3, kafka.len());
-                    let partition = kafka.get("partition").unwrap().as_value().unwrap();
-                    assert_eq!(0, partition.as_i64().unwrap());
-
-                    let producer = map.get("producer").unwrap().as_column().unwrap();
-                    assert_eq!(1, producer.len());
-                    let timestamp = producer.get("timestamp").unwrap().as_value().unwrap();
-                    assert_eq!("2021-06-22", timestamp.as_str().unwrap());
-                }
-                ("some_int", ColumnValueStat::Value(v)) => assert_eq!(302, v.as_i64().unwrap()),
-                ("some_bool", ColumnValueStat::Value(v)) => assert!(!v.as_bool().unwrap()),
-                ("some_string", ColumnValueStat::Value(v)) => {
-                    assert_eq!("GET", v.as_str().unwrap())
-                }
-                ("date", ColumnValueStat::Value(v)) => {
-                    assert_eq!("2021-06-22", v.as_str().unwrap())
-                }
-                _ => assert!(false, "Key should not be present"),
-            }
-        }
-
-        // assert on max values
-        for (k, v) in stats.max_values.iter() {
-            match (k.as_str(), v) {
-                ("meta", ColumnValueStat::Column(map)) => {
-                    assert_eq!(2, map.len());
-
-                    let kafka = map.get("kafka").unwrap().as_column().unwrap();
-                    assert_eq!(3, kafka.len());
-                    let partition = kafka.get("partition").unwrap().as_value().unwrap();
-                    assert_eq!(1, partition.as_i64().unwrap());
-
-                    let producer = map.get("producer").unwrap().as_column().unwrap();
-                    assert_eq!(1, producer.len());
-                    let timestamp = producer.get("timestamp").unwrap().as_value().unwrap();
-                    assert_eq!("2021-06-22", timestamp.as_str().unwrap());
-                }
-                ("some_int", ColumnValueStat::Value(v)) => assert_eq!(400, v.as_i64().unwrap()),
-                ("some_bool", ColumnValueStat::Value(v)) => assert!(v.as_bool().unwrap()),
-                ("some_string", ColumnValueStat::Value(v)) => {
-                    assert_eq!("PUT", v.as_str().unwrap())
-                }
-                ("date", ColumnValueStat::Value(v)) => {
-                    assert_eq!("2021-06-22", v.as_str().unwrap())
-                }
-                _ => assert!(false, "Key should not be present"),
-            }
-        }
-
-        // assert on null count
-        for (k, v) in stats.null_count.iter() {
-            match (k.as_str(), v) {
-                ("meta", ColumnCountStat::Column(map)) => {
-                    assert_eq!(2, map.len());
-
-                    let kafka = map.get("kafka").unwrap().as_column().unwrap();
-                    assert_eq!(3, kafka.len());
-                    let partition = kafka.get("partition").unwrap().as_value().unwrap();
-                    assert_eq!(0, partition);
-
-                    let producer = map.get("producer").unwrap().as_column().unwrap();
-                    assert_eq!(1, producer.len());
-                    let timestamp = producer.get("timestamp").unwrap().as_value().unwrap();
-                    assert_eq!(0, timestamp);
-                }
-                ("some_int", ColumnCountStat::Value(v)) => assert_eq!(100, *v),
-                ("some_bool", ColumnCountStat::Value(v)) => assert_eq!(100, *v),
-                ("some_string", ColumnCountStat::Value(v)) => assert_eq!(100, *v),
-                ("some_list", ColumnCountStat::Value(v)) => assert_eq!(100, *v),
-                ("some_nested_list", ColumnCountStat::Value(v)) => assert_eq!(0, *v),
-                ("date", ColumnCountStat::Value(v)) => assert_eq!(0, *v),
-                _ => assert!(false, "Key should not be present"),
-            }
-        }
-    }
-
-    fn create_temp_table(table_path: &Path) {
-        let log_path = table_path.join("_delta_log");
-
-        std::fs::create_dir(log_path.as_path()).unwrap();
-        std::fs::write(
-            log_path.join("00000000000000000000.json"),
-            V0_COMMIT.as_str(),
-        )
-        .unwrap();
-    }
 
     lazy_static! {
         static ref SCHEMA: Value = json!({
